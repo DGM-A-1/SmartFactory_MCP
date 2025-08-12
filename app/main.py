@@ -4,12 +4,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from dotenv import load_dotenv
+from urllib.parse import quote
+GH_API = "https://api.github.com"
 
 load_dotenv()  # .env 로컬만 사용 (Render에서는 환경변수 직접 설정)
 
 GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")
-DEFAULT_REPO   = os.getenv("DEFAULT_REPO", "DGM-A-1/smartfactory_ui")  # 깃헙 리포 풀네임
-DEFAULT_REF    = os.getenv("DEFAULT_REF", "main")
+DEFAULT_REPO = os.getenv("DEFAULT_REPO", "DGM-A-1/SmartFactory_UI")
+DEFAULT_REF    = os.getenv("DEFAULT_REF", "develop")
 DEFAULT_SUBDIR = os.getenv("DEFAULT_SUBDIR", "")  # 모노레포면 경로 지정, 아니면 빈값
 
 app = FastAPI(title="smartfactory_mcp (REST)")
@@ -20,11 +22,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+async def gh_tree(repo: str, ref: str):
+    # 리포의 파일 트리를 가져와서 파일명 검색에 사용
+    return await gh_get(f"{GH_API}/repos/{repo}/git/trees/{ref}", params={"recursive": "1"})
 
 async def gh_get(url, params=None):
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent":"smartfactory_mcp/1.0",
     }
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
@@ -41,43 +47,43 @@ async def health():
 
 @app.get("/search")
 async def search(q: str, repo: str | None = None, ref: str | None = None,
-                 max_results: int = 20, subdir: str | None = None):
+                 max_results: int = 20, subdir: str | None = None, mode:str = "auto"):
     """
     예: /search?q=main.dart&repo=<id>/smartfactory_ui&ref=main
     """
     repo = repo or DEFAULT_REPO
     ref  = ref or DEFAULT_REF
     subdir = (subdir if subdir is not None else DEFAULT_SUBDIR).strip()
+    query = q.strip()
 
-    query = f"{q} repo:{repo} in:file"
+    # --- (A) 파일명 검색: Git tree로 즉시 동작 ---
+    is_filename_query = query.startswith("filename:") or any(
+        query.endswith(ext) for ext in [".dart", ".yaml", ".yml", ".json", ".md"]
+    )
+    if mode in ("filename", "auto") and is_filename_query:
+        name = query.replace("filename:", "").strip()
+        tree = await gh_tree(repo, ref)
+        files = [t["path"] for t in tree.get("tree", []) if t.get("type") == "blob"]
+        if subdir:
+            files = [p for p in files if p.startswith(subdir)]
+        hits = [p for p in files if p.split("/")[-1] == name or p.endswith("/" + name)]
+        hits = hits[:max_results]
+        return [
+            {"path": p, "html_url": f"https://github.com/{repo}/blob/{ref}/{p}", "score": 1.0}
+            for p in hits
+        ]
+
+    # --- (B) 내용 검색(인덱스 기반): GitHub Search API (기본 브랜치 제한) ---
+    q2 = query
+    if "in:" not in q2 and "filename:" not in q2 and "path:" not in q2:
+        q2 = f"{q2} in:file"
+    q2 += f" repo:{repo}"
     if subdir:
-        query += f" path:{subdir}"
+        q2 += f" path:{subdir}"
 
-    data = await gh_get("https://api.github.com/search/code",
-                        params={"q": query, "per_page": max_results})
+    data = await gh_get(f"{GH_API}/search/code", params={"q": q2, "per_page": max_results})
     items = data.get("items", [])
     return [
         {"path": it.get("path"), "html_url": it.get("html_url"), "score": it.get("score")}
         for it in items
     ]
-
-@app.get("/fetch")
-async def fetch(path: str, repo: str | None = None, ref: str | None = None):
-    """
-    예: /fetch?path=lib/main.dart&repo=<id>/smartfactory_ui&ref=main
-    """
-    repo = repo or DEFAULT_REPO
-    ref  = ref or DEFAULT_REF
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-
-    data = await gh_get(url, params={"ref": ref})
-    content = data.get("content", "")
-    encoding = data.get("encoding", "")
-
-    text = ""
-    if encoding == "base64" and content:
-        try:
-            text = base64.b64decode(content).decode("utf-8", errors="ignore")
-        except Exception:
-            text = ""
-    return {"path": path, "ref": ref, "text": text}
