@@ -87,3 +87,20 @@ async def search(q: str, repo: str | None = None, ref: str | None = None,
         {"path": it.get("path"), "html_url": it.get("html_url"), "score": it.get("score")}
         for it in items
     ]
+# app/main.py (추가)
+@app.get("/tree")
+async def tree(ref: str | None = None, subdir: str | None = None, exts: str = ""):
+    """
+    예) /tree?ref=develop&exts=.dart,.yaml
+    """
+    repo = DEFAULT_REPO
+    ref  = ref or DEFAULT_REF
+    subdir = (subdir if subdir is not None else DEFAULT_SUBDIR).strip()
+    data = await gh_tree(repo, ref)
+    files = [t["path"] for t in data.get("tree", []) if t.get("type") == "blob"]
+    if subdir:
+        files = [p for p in files if p.startswith(subdir)]
+    if exts:
+        allow = {e.strip() for e in exts.split(",") if e.strip()}
+        files = [p for p in files if any(p.endswith(e) for e in allow)]
+    return [{"path": p, "url": f"https://github.com/{repo}/blob/{ref}/{p}"} for p in files]
